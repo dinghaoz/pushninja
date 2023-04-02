@@ -6,6 +6,7 @@ import (
 	firebase "firebase.google.com/go"
 	"firebase.google.com/go/messaging"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/urfave/cli/v2"
 	"google.golang.org/api/option"
@@ -21,13 +22,11 @@ func CliCommand() *cli.Command {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "cred", Aliases: []string{"C"}, Required: true},
 			&cli.StringFlag{Name: "account", Aliases: []string{"a"}},
-			&cli.StringFlag{Name: "priority", Aliases: []string{"p"}},
+			&cli.StringFlag{Name: "priority", Aliases: []string{"p"}, Value: "normal"},
 			&cli.StringFlag{Name: "channel", Aliases: []string{"c"}},
-			&cli.IntFlag{Name: "ttl", DefaultText: "3600"},
+			&cli.IntFlag{Name: "ttl", Value: 3600},
 			&cli.BoolFlag{Name: "batch", Aliases: []string{"b"}},
 			&cli.BoolFlag{Name: "dry_run"},
-
-			&cli.StringFlag{Name: "messages_file"},
 
 			&cli.BoolFlag{Name: "notification", Aliases: []string{"n"}},
 			&cli.StringFlag{Name: "title", Aliases: []string{"T"}},
@@ -84,8 +83,32 @@ func stringifyJson(m map[string]interface{}) map[string]string {
 	return data
 }
 
+func randomizeIfNeeded(data map[string]string, random bool) map[string]string {
+	if !random {
+		return data
+	}
+	newData := make(map[string]string, len(data))
+	for id, value := range data {
+		newData[id] = value
+	}
+
+	newData["salt"] = uuid.New().String()
+
+	return newData
+}
+
 func getMessages(ctx *cli.Context) ([]*messaging.Message, error) {
 	tokens := strings.Split(ctx.String("tokens"), ",")
+
+	tokenFile := ctx.String("tokens_file")
+	if len(tokenFile) > 0 {
+		bytes, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, strings.Split(string(bytes), "\n")...)
+	}
+
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("missing tokens")
 	}
@@ -109,17 +132,22 @@ func getMessages(ctx *cli.Context) ([]*messaging.Message, error) {
 		}
 	}
 
+	log.Debug().Int("ttl", ctx.Int("ttl")).Msg("flags")
 	ttl := time.Duration(ctx.Int("ttl")) * time.Second
 
 	var messages []*messaging.Message
 	for _, token := range tokens {
+		if len(token) == 0 {
+			continue
+		}
+
 		message := &messaging.Message{
 			Token: token,
 			Android: &messaging.AndroidConfig{
 				TTL:          &ttl,
 				Priority:     ctx.String("priority"),
 				Notification: notification,
-				Data:         data,
+				Data:         randomizeIfNeeded(data, ctx.Bool("random")),
 			},
 		}
 
