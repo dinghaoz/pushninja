@@ -156,6 +156,7 @@ func main(ctx *cli.Context) error {
 	messages, err := getMessages(ctx)
 
 	if ctx.Bool("batch") {
+		log.Info().Int("#msg", len(messages)).Msg("BatchSend")
 		SendMethod := fcmClient.SendAll
 		if ctx.Bool("dry_run") {
 			SendMethod = fcmClient.SendAllDryRun
@@ -175,13 +176,14 @@ func main(ctx *cli.Context) error {
 			} else {
 				for i, res := range response.Responses {
 					if !res.Success {
-						log.Error().Err(res.Error).Int("index", numOfTried+i)
+						log.Error().Err(res.Error).Int("index", numOfTried+i).Msg("Failed to send")
 					}
 				}
 			}
 			numOfTried += numToSend
 		}
 	} else {
+		log.Info().Int("#msg", len(messages)).Bool("dry_run", ctx.Bool("dry_run")).Msg("Send")
 		SendMethod := fcmClient.Send
 		if ctx.Bool("dry_run") {
 			SendMethod = fcmClient.SendDryRun
@@ -189,9 +191,9 @@ func main(ctx *cli.Context) error {
 		for _, m := range messages {
 			response, err := SendMethod(context.Background(), m)
 			if err != nil {
-				log.Error().Err(err)
+				log.Error().Err(err).Msg("Failed to send")
 			} else {
-				log.Debug().Str("response", response)
+				log.Debug().Str("response", response).Msg("msg sent")
 			}
 		}
 	}
