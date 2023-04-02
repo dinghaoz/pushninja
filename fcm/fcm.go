@@ -10,6 +10,8 @@ import (
 	"github.com/urfave/cli/v2"
 	"google.golang.org/api/option"
 	"os"
+	"strings"
+	"time"
 )
 
 func CliCommand() *cli.Command {
@@ -17,9 +19,11 @@ func CliCommand() *cli.Command {
 		Name:  "fcm",
 		Usage: "fcm usage",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "cred", Aliases: []string{"c"}},
+			&cli.StringFlag{Name: "cred", Aliases: []string{"C"}, Required: true},
 			&cli.StringFlag{Name: "account", Aliases: []string{"a"}},
 			&cli.StringFlag{Name: "priority", Aliases: []string{"p"}},
+			&cli.StringFlag{Name: "channel", Aliases: []string{"c"}},
+			&cli.IntFlag{Name: "ttl", DefaultText: "3600"},
 			&cli.BoolFlag{Name: "batch", Aliases: []string{"b"}},
 			&cli.BoolFlag{Name: "dry_run"},
 
@@ -30,7 +34,6 @@ func CliCommand() *cli.Command {
 			&cli.StringFlag{Name: "body", Aliases: []string{"B"}},
 			&cli.StringFlag{Name: "tokens", Aliases: []string{"t"}},
 			&cli.StringFlag{Name: "tokens_file"},
-			&cli.StringFlag{Name: "data", Aliases: []string{"d"}},
 			&cli.BoolFlag{Name: "random", Aliases: []string{"r"}},
 			&cli.StringFlag{Name: "data_file"},
 		},
@@ -38,16 +41,25 @@ func CliCommand() *cli.Command {
 	}
 }
 
-func getAccount(path string) (string, error) {
+func toJsonMap(path string) (map[string]interface{}, error) {
 	bytes, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var contents map[string]interface{}
 	err = json.Unmarshal(bytes, &contents)
 	if err != nil {
-		return "", nil
+		return nil, err
+	}
+
+	return contents, nil
+}
+
+func getAccount(path string) (string, error) {
+	contents, err := toJsonMap(path)
+	if err != nil {
+		return "", err
 	}
 	if clientEmail, found := contents["client_email"]; found {
 		if account, ok := clientEmail.(string); !ok {
@@ -60,8 +72,61 @@ func getAccount(path string) (string, error) {
 	}
 }
 
+func stringifyJson(m map[string]interface{}) map[string]string {
+	data := make(map[string]string)
+	for k, v := range m {
+		if s, ok := v.(string); ok {
+			data[k] = s
+		} else {
+			data[k] = fmt.Sprintf("%v", v)
+		}
+	}
+	return data
+}
+
 func getMessages(ctx *cli.Context) ([]*messaging.Message, error) {
-	return nil, nil
+	tokens := strings.Split(ctx.String("tokens"), ",")
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("missing tokens")
+	}
+
+	var data map[string]string = nil
+	dataFile := ctx.String("data_file")
+	if len(dataFile) > 0 {
+		rawData, err := toJsonMap(dataFile)
+		if err != nil {
+			return nil, err
+		}
+		data = stringifyJson(rawData)
+	}
+
+	var notification *messaging.AndroidNotification = nil
+	if ctx.Bool("notification") {
+		notification = &messaging.AndroidNotification{
+			Title:     ctx.String("title"),
+			Body:      ctx.String("body"),
+			ChannelID: ctx.String("channel"),
+		}
+	}
+
+	ttl := time.Duration(ctx.Int("ttl")) * time.Second
+
+	var messages []*messaging.Message
+	for _, token := range tokens {
+		message := &messaging.Message{
+			Token: token,
+			Android: &messaging.AndroidConfig{
+				TTL:          &ttl,
+				Priority:     ctx.String("priority"),
+				Notification: notification,
+				Data:         data,
+			},
+		}
+
+		messages = append(messages, message)
+	}
+
+	return messages, nil
 }
 
 func min(a, b int) int {
@@ -114,6 +179,7 @@ func main(ctx *cli.Context) error {
 					}
 				}
 			}
+			numOfTried += numToSend
 		}
 	} else {
 		SendMethod := fcmClient.Send
