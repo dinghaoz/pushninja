@@ -15,7 +15,7 @@ func main() {
 	log.Info().Msg("Starting app")
 	app := &cli.App{
 		Name:        "pushninjia",
-		HelpName:    "push",
+		HelpName:    "pushninjia",
 		Description: "Push debugging utility",
 	}
 

@@ -2,6 +2,7 @@ package fcm
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	firebase "firebase.google.com/go"
 	"firebase.google.com/go/messaging"
@@ -10,8 +11,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/urfave/cli/v2"
 	"google.golang.org/api/option"
+	"io"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 )
 
@@ -31,10 +33,14 @@ func CliCommand() *cli.Command {
 			&cli.BoolFlag{Name: "notification", Aliases: []string{"n"}},
 			&cli.StringFlag{Name: "title", Aliases: []string{"T"}},
 			&cli.StringFlag{Name: "body", Aliases: []string{"B"}},
-			&cli.StringFlag{Name: "tokens", Aliases: []string{"t"}},
-			&cli.StringFlag{Name: "tokens_file"},
+
+			&cli.PathFlag{Name: "targets"},
+			&cli.BoolFlag{Name: "targets_has_header", Value: false},
+			&cli.StringFlag{Name: "targets_token_col", Value: "0"},
+			&cli.StringFlag{Name: "targets_id_col", Value: "0"},
+
 			&cli.BoolFlag{Name: "random", Aliases: []string{"r"}},
-			&cli.StringFlag{Name: "data_file"},
+			&cli.PathFlag{Name: "data_file"},
 		},
 		Action: main,
 	}
@@ -97,24 +103,74 @@ func randomizeIfNeeded(data map[string]string, random bool) map[string]string {
 	return newData
 }
 
-func getMessages(ctx *cli.Context) ([]*messaging.Message, error) {
-	tokens := strings.Split(ctx.String("tokens"), ",")
+type target struct {
+	Id    string
+	Token string
+}
 
-	tokenFile := ctx.String("tokens_file")
-	if len(tokenFile) > 0 {
-		bytes, err := os.ReadFile(tokenFile)
+func getTargets(path string, hasHeader bool, idCol string, tokenCol string) ([]target, error) {
+	log.Debug().Msg("getTargets")
+	if len(path) == 0 {
+		return nil, fmt.Errorf("missing target file name")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to close file")
+		}
+	}(file)
+
+	var targets []target
+	var header []string
+	reader := csv.NewReader(file)
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+
 		if err != nil {
 			return nil, err
 		}
-		tokens = append(tokens, strings.Split(string(bytes), "\n")...)
+
+		if header == nil && hasHeader {
+			header = record
+		} else {
+			var t target
+			for i, field := range record {
+				col := strconv.Itoa(i)
+				if header != nil {
+					col = header[i]
+				}
+
+				if col == idCol {
+					t.Id = field
+				} else if col == tokenCol {
+					t.Token = field
+				}
+			}
+
+			targets = append(targets, t)
+		}
 	}
 
-	if len(tokens) == 0 {
+	return targets, nil
+}
+
+func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, error) {
+	log.Debug().Msg("getMessages")
+	if len(targets) == 0 {
 		return nil, fmt.Errorf("missing tokens")
 	}
 
+	log.Debug().Int("len", len(targets)).Msg("convert from targets")
+
 	var data map[string]string = nil
-	dataFile := ctx.String("data_file")
+	dataFile := ctx.Path("data_file")
 	if len(dataFile) > 0 {
 		rawData, err := toJsonMap(dataFile)
 		if err != nil {
@@ -136,13 +192,13 @@ func getMessages(ctx *cli.Context) ([]*messaging.Message, error) {
 	ttl := time.Duration(ctx.Int("ttl")) * time.Second
 
 	var messages []*messaging.Message
-	for _, token := range tokens {
-		if len(token) == 0 {
+	for _, t := range targets {
+		if len(t.Token) == 0 {
 			continue
 		}
 
 		message := &messaging.Message{
-			Token: token,
+			Token: t.Token,
 			Android: &messaging.AndroidConfig{
 				TTL:          &ttl,
 				Priority:     ctx.String("priority"),
@@ -181,7 +237,25 @@ func main(ctx *cli.Context) error {
 		return err
 	}
 
-	messages, err := getMessages(ctx)
+	targets, err := getTargets(
+		ctx.Path("targets"),
+		ctx.Bool("targets_has_header"),
+		ctx.String("targets_id_col"),
+		ctx.String("targets_token_col"),
+	)
+	if err != nil {
+		return err
+	}
+
+	log.Info().Int("num", len(targets)).Msg("targets retrieved")
+
+	messages, err := getMessages(targets, ctx)
+	if err != nil {
+		return err
+	}
+
+	var failedIds []string
+	var succeededIds []string
 
 	if ctx.Bool("batch") {
 		log.Info().Int("#msg", len(messages)).Msg("BatchSend")
@@ -200,11 +274,18 @@ func main(ctx *cli.Context) error {
 
 			response, err := SendMethod(context.Background(), messages[numOfTried:numOfTried+numToSend])
 			if err != nil {
-				log.Error().Err(err).Int("fromIndex", numOfTried)
+				log.Error().Err(err).Int("fromIndex", numOfTried).Msg("Failed to send")
+				for i := numOfTried; i < numOfTried+numToSend; i++ {
+					failedIds = append(failedIds, targets[i].Id)
+				}
 			} else {
 				for i, res := range response.Responses {
+					index := numOfTried + i
 					if !res.Success {
-						log.Error().Err(res.Error).Int("index", numOfTried+i).Msg("Failed to send")
+						log.Error().Err(res.Error).Int("index", index).Str("Id", targets[index].Id).Msg("Failed response")
+						failedIds = append(failedIds, targets[index].Id)
+					} else {
+						succeededIds = append(succeededIds, targets[index].Id)
 					}
 				}
 			}
@@ -216,15 +297,20 @@ func main(ctx *cli.Context) error {
 		if ctx.Bool("dry_run") {
 			SendMethod = fcmClient.SendDryRun
 		}
-		for _, m := range messages {
+		for i, m := range messages {
 			response, err := SendMethod(context.Background(), m)
 			if err != nil {
-				log.Error().Err(err).Msg("Failed to send")
+				log.Error().Err(err).Int("index", i).Str("Id", targets[i].Id).Msg("Failed response")
+				failedIds = append(failedIds, targets[i].Id)
 			} else {
 				log.Debug().Str("response", response).Msg("msg sent")
+				succeededIds = append(succeededIds, targets[i].Id)
 			}
 		}
 	}
+
+	log.Info().Int("Succeeded", len(succeededIds)).Int("Failed", len(failedIds)).Msg("Results")
+	log.Info().Interface("SucceededIds", succeededIds).Msg("Details")
 
 	return nil
 }
