@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,25 +23,35 @@ func CliCommand() *cli.Command {
 		Name:  "fcm",
 		Usage: "fcm usage",
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "cred", Aliases: []string{"C"}, Required: true},
+			&cli.PathFlag{Name: "cred_file", Required: true},
 			&cli.StringFlag{Name: "account", Aliases: []string{"a"}},
-			&cli.StringFlag{Name: "priority", Aliases: []string{"p"}, Value: "normal"},
-			&cli.StringFlag{Name: "channel", Aliases: []string{"c"}},
-			&cli.IntFlag{Name: "ttl", Value: 3600},
+			&cli.StringFlag{Name: "priority", Value: "normal"},
+			&cli.DurationFlag{Name: "ttl", Value: 1 * time.Hour},
+
 			&cli.BoolFlag{Name: "batch", Aliases: []string{"b"}},
 			&cli.BoolFlag{Name: "dry_run"},
 
 			&cli.BoolFlag{Name: "notification", Aliases: []string{"n"}},
 			&cli.StringFlag{Name: "title", Aliases: []string{"T"}},
 			&cli.StringFlag{Name: "body", Aliases: []string{"B"}},
+			&cli.StringFlag{Name: "image"},
+			&cli.StringFlag{Name: "channel"},
 
 			&cli.PathFlag{Name: "targets"},
 			&cli.BoolFlag{Name: "targets_has_header", Value: false},
 			&cli.StringFlag{Name: "targets_token_col", Value: "0"},
 			&cli.StringFlag{Name: "targets_id_col", Value: "0"},
+			&cli.IntFlag{Name: "targets_start", Value: 0},
+			&cli.IntFlag{Name: "targets_count", Value: 10000},
 
-			&cli.BoolFlag{Name: "random", Aliases: []string{"r"}},
 			&cli.PathFlag{Name: "data_file"},
+			&cli.StringFlag{Name: "data_random_key"},
+			&cli.StringFlag{Name: "data_entry1"},
+			&cli.StringFlag{Name: "data_entry2"},
+			&cli.StringFlag{Name: "data_entry3"},
+			&cli.StringFlag{Name: "data_entry4"},
+
+			&cli.PathFlag{Name: "history_dir"},
 		},
 		Action: main,
 	}
@@ -89,8 +100,8 @@ func stringifyJson(m map[string]interface{}) map[string]string {
 	return data
 }
 
-func randomizeIfNeeded(data map[string]string, random bool) map[string]string {
-	if !random {
+func randomizeIfNeeded(data map[string]string, randomKey string) map[string]string {
+	if len(randomKey) == 0 {
 		return data
 	}
 	newData := make(map[string]string, len(data))
@@ -98,7 +109,7 @@ func randomizeIfNeeded(data map[string]string, random bool) map[string]string {
 		newData[id] = value
 	}
 
-	newData["salt"] = uuid.New().String()
+	newData[randomKey] = uuid.New().String()
 
 	return newData
 }
@@ -108,12 +119,32 @@ type target struct {
 	Token string
 }
 
-func getTargets(path string, hasHeader bool, idCol string, tokenCol string) ([]target, error) {
-	log.Debug().Msg("getTargets")
+func openAndSkipBOM(path string) (*os.File, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	var bom [3]byte
+	_, err = io.ReadFull(file, bom[:])
+	if err != nil {
+		return nil, err
+	}
+	if bom[0] != 0xef || bom[1] != 0xbb || bom[2] != 0xbf {
+		_, err = file.Seek(0, 0) // Not a BOM -- seek back to the beginning
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return file, nil
+}
+
+func getTargets(path string, hasHeader bool, start, count int, idCol, tokenCol string) ([]target, error) {
+	log.Debug().Str("idCol", idCol).Str("tokenCol", tokenCol).Msg("getTargets")
 	if len(path) == 0 {
 		return nil, fmt.Errorf("missing target file name")
 	}
-	file, err := os.Open(path)
+	file, err := openAndSkipBOM(path)
 	if err != nil {
 		return nil, err
 	}
@@ -124,10 +155,16 @@ func getTargets(path string, hasHeader bool, idCol string, tokenCol string) ([]t
 		}
 	}(file)
 
+	actualStart := start
+	if hasHeader {
+		actualStart += 1
+	}
+
 	var targets []target
 	var header []string
 	reader := csv.NewReader(file)
-	for {
+	row := 0
+	for row-actualStart < count {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
@@ -140,25 +177,58 @@ func getTargets(path string, hasHeader bool, idCol string, tokenCol string) ([]t
 		if header == nil && hasHeader {
 			header = record
 		} else {
-			var t target
-			for i, field := range record {
-				col := strconv.Itoa(i)
-				if header != nil {
-					col = header[i]
+			if row >= actualStart {
+				var t target
+				for i, field := range record {
+					col := strconv.Itoa(i)
+					if header != nil {
+						col = header[i]
+					}
+
+					if col == idCol {
+						t.Id = field
+					} else if col == tokenCol {
+						t.Token = field
+					}
 				}
 
-				if col == idCol {
-					t.Id = field
-				} else if col == tokenCol {
-					t.Token = field
+				if len(t.Id) == 0 || len(t.Token) == 0 {
+					log.Error().Interface("row", record).Msg("Corrupted target row")
+				} else {
+					targets = append(targets, t)
 				}
 			}
-
-			targets = append(targets, t)
 		}
+
+		row += 1
 	}
 
 	return targets, nil
+}
+
+func getData(ctx *cli.Context) (map[string]string, error) {
+	var data map[string]string
+	dataFile := ctx.Path("data_file")
+	if len(dataFile) > 0 {
+		rawData, err := toJsonMap(dataFile)
+		if err != nil {
+			return nil, err
+		}
+		data = stringifyJson(rawData)
+	}
+
+	for i := 1; i < 5; i++ {
+		flag := fmt.Sprintf("data_entry%d", i)
+		entry := ctx.String(flag)
+		if len(entry) > 0 {
+			comps := strings.Split(entry, ":")
+			if len(comps) == 2 {
+				data[comps[0]] = comps[1]
+			}
+		}
+	}
+
+	return data, nil
 }
 
 func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, error) {
@@ -169,14 +239,9 @@ func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, erro
 
 	log.Debug().Int("len", len(targets)).Msg("convert from targets")
 
-	var data map[string]string = nil
-	dataFile := ctx.Path("data_file")
-	if len(dataFile) > 0 {
-		rawData, err := toJsonMap(dataFile)
-		if err != nil {
-			return nil, err
-		}
-		data = stringifyJson(rawData)
+	data, err := getData(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	var notification *messaging.AndroidNotification = nil
@@ -184,12 +249,13 @@ func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, erro
 		notification = &messaging.AndroidNotification{
 			Title:     ctx.String("title"),
 			Body:      ctx.String("body"),
+			ImageURL:  ctx.String("image"),
 			ChannelID: ctx.String("channel"),
 		}
 	}
 
-	log.Debug().Int("ttl", ctx.Int("ttl")).Msg("flags")
-	ttl := time.Duration(ctx.Int("ttl")) * time.Second
+	ttl := ctx.Duration("ttl")
+	log.Debug().Interface("ttl", ttl).Msg("flags")
 
 	var messages []*messaging.Message
 	for _, t := range targets {
@@ -203,7 +269,7 @@ func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, erro
 				TTL:          &ttl,
 				Priority:     ctx.String("priority"),
 				Notification: notification,
-				Data:         randomizeIfNeeded(data, ctx.Bool("random")),
+				Data:         randomizeIfNeeded(data, ctx.String("data_random_key")),
 			},
 		}
 
@@ -221,11 +287,17 @@ func min(a, b int) int {
 }
 
 func main(ctx *cli.Context) error {
-	account, err := getAccount(ctx.String("cred"))
-	if err != nil {
-		return err
+	credFilePath := ctx.Path("cred_file")
+	account := ctx.String("account")
+	if len(account) == 0 {
+		var err error
+		account, err = getAccount(credFilePath)
+		if err != nil {
+			return err
+		}
 	}
-	opt := option.WithCredentialsFile(ctx.String("cred"))
+
+	opt := option.WithCredentialsFile(credFilePath)
 	cfg := &firebase.Config{ServiceAccountID: account}
 	fbApp, err := firebase.NewApp(context.Background(), cfg, opt)
 	if err != nil {
@@ -240,6 +312,8 @@ func main(ctx *cli.Context) error {
 	targets, err := getTargets(
 		ctx.Path("targets"),
 		ctx.Bool("targets_has_header"),
+		ctx.Int("targets_start"),
+		ctx.Int("targets_count"),
 		ctx.String("targets_id_col"),
 		ctx.String("targets_token_col"),
 	)
