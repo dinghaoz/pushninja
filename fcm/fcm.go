@@ -51,6 +51,11 @@ func CliCommand() *cli.Command {
 			&cli.StringFlag{Name: "data_entry3"},
 			&cli.StringFlag{Name: "data_entry4"},
 
+			&cli.StringFlag{Name: "filter1"},
+			&cli.StringFlag{Name: "filter2"},
+			&cli.StringFlag{Name: "filter3"},
+			&cli.StringFlag{Name: "filter4"},
+
 			&cli.PathFlag{Name: "history_dir"},
 		},
 		Action: main,
@@ -70,6 +75,68 @@ func toJsonMap(path string) (map[string]interface{}, error) {
 	}
 
 	return contents, nil
+}
+
+func getFilters(ctx *cli.Context) []map[string]func(string) bool {
+	var anyMatches []map[string]func(string) bool
+	for i := 1; i < 5; i++ {
+		allMatches := make(map[string]func(string) bool)
+		flag := fmt.Sprintf("filter%d", i)
+		entry := ctx.String(flag)
+		if len(entry) > 0 {
+			clauses := strings.Split(entry, ";")
+			for _, clause := range clauses {
+				comps := strings.Split(clause, "!=")
+				if len(comps) == 2 {
+					allMatches[comps[0]] = func(value string) bool {
+						return comps[1] != value
+					}
+				} else {
+					comps = strings.Split(clause, "=")
+					if len(comps) == 2 {
+						allMatches[comps[0]] = func(value string) bool {
+							return comps[1] == value
+						}
+					}
+				}
+			}
+			anyMatches = append(anyMatches, allMatches)
+		}
+	}
+
+	log.Debug().Int("anyMatches", len(anyMatches)).Msg("getFilters")
+	return anyMatches
+}
+
+func matchesAll(record map[string]string, filter map[string]func(string) bool) bool {
+	if len(filter) == 0 {
+		return false
+	}
+	for key, predicate := range filter {
+		value, ok := record[key]
+		if !ok {
+			continue
+		}
+		if !predicate(value) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func matchesAny(record map[string]string, filters []map[string]func(string) bool) bool {
+	if len(filters) == 0 {
+		return true
+	}
+
+	for _, filter := range filters {
+		if matchesAll(record, filter) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func getAccount(path string) (string, error) {
@@ -139,7 +206,7 @@ func openAndSkipBOM(path string) (*os.File, error) {
 	return file, nil
 }
 
-func getTargets(path string, hasHeader bool, start, count int, idCol, tokenCol string) ([]target, error) {
+func getTargets(path string, hasHeader bool, start, count int, idCol, tokenCol string, anyMatches []map[string]func(string) bool) ([]target, error) {
 	log.Debug().Str("idCol", idCol).Str("tokenCol", tokenCol).Msg("getTargets")
 	if len(path) == 0 {
 		return nil, fmt.Errorf("missing target file name")
@@ -178,24 +245,26 @@ func getTargets(path string, hasHeader bool, start, count int, idCol, tokenCol s
 			header = record
 		} else {
 			if row >= actualStart {
-				var t target
+				recordMap := make(map[string]string)
 				for i, field := range record {
 					col := strconv.Itoa(i)
 					if header != nil {
 						col = header[i]
 					}
-
-					if col == idCol {
-						t.Id = field
-					} else if col == tokenCol {
-						t.Token = field
-					}
+					recordMap[col] = field
 				}
 
-				if len(t.Id) == 0 || len(t.Token) == 0 {
-					log.Error().Interface("row", record).Msg("Corrupted target row")
-				} else {
-					targets = append(targets, t)
+				if matchesAny(recordMap, anyMatches) {
+					t := target{
+						Id:    recordMap[idCol],
+						Token: recordMap[tokenCol],
+					}
+
+					if len(t.Id) == 0 || len(t.Token) == 0 {
+						log.Error().Interface("row", record).Msg("Corrupted target row")
+					} else {
+						targets = append(targets, t)
+					}
 				}
 			}
 		}
@@ -233,10 +302,6 @@ func getData(ctx *cli.Context) (map[string]string, error) {
 
 func getMessages(targets []target, ctx *cli.Context) ([]*messaging.Message, error) {
 	log.Debug().Msg("getMessages")
-	if len(targets) == 0 {
-		return nil, fmt.Errorf("missing tokens")
-	}
-
 	log.Debug().Int("len", len(targets)).Msg("convert from targets")
 
 	data, err := getData(ctx)
@@ -316,6 +381,7 @@ func main(ctx *cli.Context) error {
 		ctx.Int("targets_count"),
 		ctx.String("targets_id_col"),
 		ctx.String("targets_token_col"),
+		getFilters(ctx),
 	)
 	if err != nil {
 		return err
